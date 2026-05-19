@@ -36,6 +36,7 @@
 static constexpr uint32_t SENSOR_INTERVAL_MS   = 500U;
 static constexpr uint32_t WIFI_RETRY_MS        = 5000U;
 static constexpr uint32_t MQTT_RETRY_MS        = 3000U;
+static constexpr uint32_t STATUS_INTERVAL_MS   = 60000U;  // Every 60 seconds
 
 // =============================================================================
 // BINARY PAYLOAD — exactly 16 bytes, packed, zero padding
@@ -68,19 +69,19 @@ static OcsMedianFilter s_temp_filter;
 static OcsMedianFilter s_hum_filter;
 
 // SoD Firewalls — one per channel
-static ocs::SoDFirewall::Config s_temp_fw_cfg = {
+static ocs::SoDFirewall::Config s_temp_firewall_config = {
     .delta            = 0.25f,   // °C
     .heartbeat_sec    = 60U,     // force transmit every 60 s
     .min_interval_sec = 1U       // gate: no faster than 1 s
 };
-static ocs::SoDFirewall::State s_temp_fw_state = { .version = 0 };
+static ocs::SoDFirewall::State s_temp_firewall_state = { .version = 0 };
 
-static ocs::SoDFirewall::Config s_hum_fw_cfg = {
+static ocs::SoDFirewall::Config s_hum_firewall_config = {
     .delta            = 0.5f,    // %RH
     .heartbeat_sec    = 60U,
     .min_interval_sec = 1U
 };
-static ocs::SoDFirewall::State s_hum_fw_state = { .version = 0 };
+static ocs::SoDFirewall::State s_hum_firewall_state = { .version = 0 };
 
 // MQTT + WiFi
 static WiFiClient   s_wifi_client;
@@ -93,6 +94,12 @@ static uint16_t s_sequence = 0U;
 static uint32_t s_last_sensor_ms  = 0U;
 static uint32_t s_last_wifi_ms    = 0U;
 static uint32_t s_last_mqtt_ms    = 0U;
+static uint32_t s_last_status_ms  = 0U;
+static uint32_t s_startup_ms      = 0U;
+
+// Connection state tracking
+static bool s_wifi_connected_prev = false;
+static bool s_mqtt_connected_prev = false;
 
 // =============================================================================
 // ANALOG SENSOR READ — replace with your actual sensor driver
@@ -115,11 +122,48 @@ static inline float read_humidity_raw()
 }
 
 // =============================================================================
-// WIFI — non-blocking reconnect
+// DIAGNOSTIC LOGGING UTILITIES
+// =============================================================================
+static void log_mqtt_error(int8_t state)
+{
+    const char* err_msg = "Unknown";
+    
+    switch (state) {
+        case -4: err_msg = "Connection timeout"; break;
+        case -3: err_msg = "Connection lost"; break;
+        case -2: err_msg = "Connection refused"; break;
+        case -1: err_msg = "Disconnected"; break;
+        case 0:  err_msg = "Connected"; break;
+        case 1:  err_msg = "Bad protocol"; break;
+        case 2:  err_msg = "Bad client ID"; break;
+        case 3:  err_msg = "Server unavailable"; break;
+        case 4:  err_msg = "Bad credentials"; break;
+        case 5:  err_msg = "Not authorized"; break;
+    }
+    
+    Serial.printf("[MQTT] State: %s (%d)\n", err_msg, state);
+}
+
+// =============================================================================
+// WIFI — non-blocking reconnect with improved stability
 // =============================================================================
 static void wifi_task(uint32_t now)
 {
-    if (WiFi.status() == WL_CONNECTED) {
+    uint8_t wifi_status = WiFi.status();
+    bool wifi_connected = (wifi_status == WL_CONNECTED);
+
+    // Log state change
+    if (wifi_connected != s_wifi_connected_prev) {
+        s_wifi_connected_prev = wifi_connected;
+        if (wifi_connected) {
+            Serial.printf("[WiFi] ✓ Connected to '%s' (RSSI: %d dBm)\n", 
+                WiFi.SSID().c_str(), WiFi.RSSI());
+        } else {
+            Serial.printf("[WiFi] ✗ Disconnected (status: %u)\n", wifi_status);
+        }
+    }
+
+    if (wifi_connected) {
         return;
     }
 
@@ -128,14 +172,19 @@ static void wifi_task(uint32_t now)
     }
 
     s_last_wifi_ms = now;
-    WiFi.disconnect(true);
+
+    // Only disconnect if in unstable state (avoid radio thrashing)
+    if (wifi_status != WL_IDLE_STATUS && wifi_status != WL_NO_SSID_AVAIL) {
+        WiFi.disconnect(false);  // Don't power down radio; just disconnect
+    }
+
     WiFi.mode(WIFI_STA);
+    Serial.printf("[WiFi] Attempting connection to '%s'...\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    // Connection is polled next iteration — no blocking waitForConnectResult()
 }
 
 // =============================================================================
-// MQTT — non-blocking reconnect with LWT
+// MQTT — non-blocking reconnect with LWT and error reporting
 // =============================================================================
 static void mqtt_task(uint32_t now)
 {
@@ -143,7 +192,20 @@ static void mqtt_task(uint32_t now)
         return;
     }
 
-    if (s_mqtt_client.connected()) {
+    bool mqtt_connected = s_mqtt_client.connected();
+
+    // Log state change
+    if (mqtt_connected != s_mqtt_connected_prev) {
+        s_mqtt_connected_prev = mqtt_connected;
+        if (mqtt_connected) {
+            Serial.println("[MQTT] ✓ Connected to broker");
+        } else {
+            Serial.printf("[MQTT] ✗ Disconnected\n");
+            log_mqtt_error(s_mqtt_client.state());
+        }
+    }
+
+    if (mqtt_connected) {
         s_mqtt_client.loop();
         return;
     }
@@ -154,7 +216,9 @@ static void mqtt_task(uint32_t now)
 
     s_last_mqtt_ms = now;
 
-    // Establish connection with LWT — constants from ocs_lwt_config.h
+    Serial.printf("[MQTT] Attempting connection to %s:%u...\n", 
+        MQTT_BROKER, MQTT_PORT);
+
     bool connected = s_mqtt_client.connect(
         OCS_LWT::CLIENT_ID,             // clientId
         nullptr,                        // username
@@ -166,14 +230,68 @@ static void mqtt_task(uint32_t now)
     );
 
     if (connected) {
+        Serial.println("[MQTT] Publishing online status...");
+        
         // Announce online presence
-        s_mqtt_client.publish(
+        bool pub_ok = s_mqtt_client.publish(
             OCS_LWT::STATUS_TOPIC,
             reinterpret_cast<const uint8_t*>(OCS_LWT::MSG_ONLINE),
             sizeof(OCS_LWT::MSG_ONLINE) - 1U,  // strip null terminator
             OCS_LWT::RETAIN
         );
+        
+        if (!pub_ok) {
+            Serial.println("[MQTT] ✗ Failed to publish online status");
+        }
+    } else {
+        log_mqtt_error(s_mqtt_client.state());
     }
+}
+
+// =============================================================================
+// STATUS & HEARTBEAT — periodic diagnostic publishing
+// =============================================================================
+static void status_task(uint32_t now)
+{
+    if ((uint32_t)(now - s_last_status_ms) < STATUS_INTERVAL_MS) {
+        return;
+    }
+
+    s_last_status_ms = now;
+
+    if (!s_mqtt_client.connected()) {
+        return;
+    }
+
+    uint32_t uptime_sec = (now - s_startup_ms) / 1000U;
+    int32_t rssi = WiFi.RSSI();
+
+    // Publish uptime as diagnostic (topic: ocs/uptime)
+    char uptime_str[32];
+    snprintf(uptime_str, sizeof(uptime_str), "%u", uptime_sec);
+    
+    bool uptime_ok = s_mqtt_client.publish(
+        OCS_LWT::UPTIME_TOPIC,
+        reinterpret_cast<const uint8_t*>(uptime_str),
+        strlen(uptime_str),
+        false
+    );
+
+    // Publish heartbeat as counter
+    char hb_str[16];
+    snprintf(hb_str, sizeof(hb_str), "%u", s_sequence);
+    
+    bool hb_ok = s_mqtt_client.publish(
+        OCS_LWT::HEARTBEAT_TOPIC,
+        reinterpret_cast<const uint8_t*>(hb_str),
+        strlen(hb_str),
+        false
+    );
+
+    Serial.printf("[Status] Uptime: %u s | WiFi RSSI: %d dBm | Seq: %u | Topics: %s/%s\n",
+        uptime_sec, rssi, s_sequence,
+        uptime_ok ? "✓" : "✗",
+        hb_ok ? "✓" : "✗");
 }
 
 // =============================================================================
@@ -195,16 +313,17 @@ static void sensor_task(uint32_t now)
     uint32_t now_sec = now / 1000U;
 
     bool temp_fired = ocs::SoDFirewall::should_transmit(
-        temp_filtered, now_sec, s_temp_fw_cfg, s_temp_fw_state);
+        temp_filtered, now_sec, s_temp_firewall_config, s_temp_firewall_state);
 
     bool hum_fired = ocs::SoDFirewall::should_transmit(
-        hum_filtered, now_sec, s_hum_fw_cfg, s_hum_fw_state);
+        hum_filtered, now_sec, s_hum_firewall_config, s_hum_firewall_state);
 
     if (!temp_fired && !hum_fired) {
         return;  // Nothing changed — suppress transmission
     }
 
     if (!s_mqtt_client.connected()) {
+        Serial.printf("[Sensor] ⚠ MQTT not connected, frame dropped (seq=%u)\n", s_sequence);
         return;  // Drop frame; broker unreachable
     }
 
@@ -219,12 +338,21 @@ static void sensor_task(uint32_t now)
     payload.sequence      = s_sequence++;
 
     // 4. Transmit raw bytes — no JSON, no String, no heap
-    s_mqtt_client.publish(
+    bool pub_ok = s_mqtt_client.publish(
         OCS_LWT::DATA_TOPIC,
         reinterpret_cast<const uint8_t*>(&payload),
         sizeof(payload),
-        false   // retain = false for live telemetry frames
+        OCS_LWT::QOS_DATA  // Use consistent QoS from config
     );
+
+    if (!pub_ok) {
+        Serial.printf("[Sensor] ✗ Publish FAILED (seq=%u, T=%.1f°C, H=%.1f%%)\n",
+            payload.sequence - 1, temp_filtered, hum_filtered);
+        s_sequence--;  // Rollback on failure
+    } else {
+        Serial.printf("[Sensor] ✓ Frame %u published (T=%.1f°C, H=%.1f%%, flags=0x%02x)\n",
+            payload.sequence - 1, temp_filtered, hum_filtered, payload.flags);
+    }
 }
 
 // =============================================================================
@@ -233,6 +361,14 @@ static void sensor_task(uint32_t now)
 void setup()
 {
     Serial.begin(115200);
+    delay(500);  // Let serial stabilize
+
+    Serial.println("\n========================================");
+    Serial.println("OCS Edge Node — Telemetry System");
+    Serial.printf("Build: %s %s\n", __DATE__, __TIME__);
+    Serial.printf("Firmware: %s\n", OCS_LWT::FIRMWARE_VERSION);
+    Serial.printf("Node ID: %s\n", OCS_LWT::CLIENT_ID);
+    Serial.println("========================================\n");
 
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);  // 0–3.3 V range
@@ -240,8 +376,16 @@ void setup()
     s_mqtt_client.setServer(MQTT_BROKER, MQTT_PORT);
     s_mqtt_client.setBufferSize(64U);  // header + 16-byte payload fits easily
 
-    // Firewall states self-initialise on first call via version sentinel check
-    // (OCS_FIREWALL_STATE_VERSION). No explicit init needed here.
+    s_startup_ms = millis();
+
+    Serial.println("[Setup] ✓ Initialization complete");
+    Serial.printf("[Setup] WiFi SSID: %s\n", WIFI_SSID);
+    Serial.printf("[Setup] MQTT Broker: %s:%u\n", MQTT_BROKER, MQTT_PORT);
+    Serial.printf("[Setup] Topics: %s, %s, %s, %s\n",
+        OCS_LWT::DATA_TOPIC,
+        OCS_LWT::STATUS_TOPIC,
+        OCS_LWT::UPTIME_TOPIC,
+        OCS_LWT::HEARTBEAT_TOPIC);
 }
 
 void loop()
@@ -251,4 +395,5 @@ void loop()
     wifi_task(now);
     mqtt_task(now);
     sensor_task(now);
+    status_task(now);
 }
