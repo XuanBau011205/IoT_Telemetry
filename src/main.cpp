@@ -4,12 +4,15 @@
 // =============================================================================
 
 #include <Arduino.h>
+#include <DHT.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <math.h>
 
-#include "ocs_median.h"
+#include "OCS_RobustWindowFilter.h"
 #include "ocs_firewall_v4.h"
 #include "ocs_lwt_config.h"
+#include "sensor_logic.h"
 
 // =============================================================================
 // NETWORK CREDENTIALS — override via build flags in platformio.ini
@@ -23,13 +26,13 @@
 #endif
 
 #ifndef MQTT_BROKER
-#define MQTT_BROKER "192.168.1.100"
+#define MQTT_BROKER "broker.hivemq.com"
 #endif
 
 #ifndef MQTT_PORT
 #define MQTT_PORT 1883
 #endif
-
+// #define ENABLE_MQTT_JSON_DEBUG 1
 // =============================================================================
 // TIMING CONSTANTS (milliseconds)
 // =============================================================================
@@ -37,6 +40,7 @@ static constexpr uint32_t SENSOR_INTERVAL_MS   = 500U;
 static constexpr uint32_t WIFI_RETRY_MS        = 5000U;
 static constexpr uint32_t MQTT_RETRY_MS        = 3000U;
 static constexpr uint32_t STATUS_INTERVAL_MS   = 60000U;  // Every 60 seconds
+static constexpr uint32_t DHT_READ_INTERVAL_MS = 2000U;
 
 // =============================================================================
 // BINARY PAYLOAD — exactly 16 bytes, packed, zero padding
@@ -64,9 +68,10 @@ static_assert(sizeof(OcsPayload) == 16U,
 // STATIC INSTANCES — zero heap, all state lives in .bss / .data
 // =============================================================================
 
-// Median filters
-static OcsMedianFilter s_temp_filter;
-static OcsMedianFilter s_hum_filter;
+// Robust window filters keep the existing median-window smoothing behavior.
+static OCS_RobustWindowFilter s_temp_filter;
+static OCS_RobustWindowFilter s_hum_filter;
+static OCS_RobustWindowFilter s_mq2_filter;
 
 // SoD Firewalls — one per channel
 static ocs::SoDFirewall::Config s_temp_firewall_config = {
@@ -95,30 +100,102 @@ static uint32_t s_last_sensor_ms  = 0U;
 static uint32_t s_last_wifi_ms    = 0U;
 static uint32_t s_last_mqtt_ms    = 0U;
 static uint32_t s_last_status_ms  = 0U;
+static uint32_t s_last_dht_ms     = 0U;
 static uint32_t s_startup_ms      = 0U;
 
 // Connection state tracking
 static bool s_wifi_connected_prev = false;
 static bool s_mqtt_connected_prev = false;
 
+static_assert(MQ2_MEDIAN_WINDOW == WINDOW_SIZE,
+    "MQ2_MEDIAN_WINDOW must match OCS_RobustWindowFilter WINDOW_SIZE.");
+
+static uint16_t s_mq2_raw = 0U;
+static float    s_mq2_median = 0.0f;
+static uint8_t  s_smoke_index = 0U;
+static bool     s_smoke_detected = false;
+static uint8_t  s_smoke_severity = 0U;
+
+// Binary telemetry is the production contract consumed by the backend.
+// This JSON mirror is only for MQTT Explorer/manual inspection.
+#if ENABLE_MQTT_JSON_DEBUG
+static void publishTelemetryJsonDebug(const OcsPayload& payload)
+{
+    char json[320];
+    SensorDebugSnapshot snapshot = {
+        payload.timestamp_sec,
+        payload.temperature,
+        payload.humidity,
+        payload.node_id,
+        payload.flags,
+        payload.sequence,
+        s_mq2_raw,
+        s_mq2_median,
+        s_smoke_index,
+        s_smoke_detected,
+        s_smoke_severity
+    };
+
+    formatTelemetryJsonDebug(json, sizeof(json), snapshot);
+
+    s_mqtt_client.publish(OCS_LWT::DEBUG_JSON_TOPIC, json);
+}
+#endif
+
 // =============================================================================
 // ANALOG SENSOR READ — replace with your actual sensor driver
 // GPIO 34 = temperature analog, GPIO 35 = humidity analog (placeholder)
 // =============================================================================
-static constexpr uint8_t PIN_TEMP_ADC = 34U;
-static constexpr uint8_t PIN_HUM_ADC  = 35U;
+static constexpr uint8_t PIN_DHT22    = 4U;
+static constexpr uint8_t PIN_MQ2_ADC  = 32U;
+
+static DHT s_dht(PIN_DHT22, DHT22);
+
+static bool  s_dht_has_valid_reading = false;
+static float s_last_temperature_c = 25.0f;
+static float s_last_humidity_pct = 50.0f;
 
 static inline float read_temperature_raw()
 {
     // Example: 12-bit ADC → 0–3.3 V → linear map to -40…85 °C
-    uint16_t raw = static_cast<uint16_t>(analogRead(PIN_TEMP_ADC));
-    return -40.0f + (static_cast<float>(raw) / 4095.0f) * 125.0f;
+    return s_last_temperature_c;
 }
 
 static inline float read_humidity_raw()
 {
-    uint16_t raw = static_cast<uint16_t>(analogRead(PIN_HUM_ADC));
-    return (static_cast<float>(raw) / 4095.0f) * 100.0f;
+    return s_last_humidity_pct;
+}
+
+static inline uint16_t read_mq2_raw()
+{
+    return static_cast<uint16_t>(analogRead(PIN_MQ2_ADC));
+}
+
+static bool read_dht22_safe(uint32_t now, float& temperature_c, float& humidity_pct)
+{
+    if (s_dht_has_valid_reading &&
+        (uint32_t)(now - s_last_dht_ms) < DHT_READ_INTERVAL_MS) {
+        temperature_c = s_last_temperature_c;
+        humidity_pct = s_last_humidity_pct;
+        return true;
+    }
+
+    s_last_dht_ms = now;
+    float t = s_dht.readTemperature();
+    float h = s_dht.readHumidity();
+
+    if (!isnan(t) && !isnan(h)) {
+        s_last_temperature_c = t;
+        s_last_humidity_pct = h;
+        s_dht_has_valid_reading = true;
+        temperature_c = t;
+        humidity_pct = h;
+        return true;
+    }
+
+    temperature_c = s_last_temperature_c;
+    humidity_pct = s_last_humidity_pct;
+    return s_dht_has_valid_reading;
 }
 
 // =============================================================================
@@ -305,9 +382,21 @@ static void sensor_task(uint32_t now)
 
     s_last_sensor_ms = now;
 
-    // 1. Read raw ADC and filter
-    float temp_filtered = s_temp_filter.process(read_temperature_raw());
-    float hum_filtered  = s_hum_filter.process(read_humidity_raw());
+    // 1. Read real sensors and filter
+    float temperature_c;
+    float humidity_pct;
+    bool dht_ok = read_dht22_safe(now, temperature_c, humidity_pct);
+    float temp_filtered = s_temp_filter.process(temperature_c);
+    float hum_filtered  = s_hum_filter.process(humidity_pct);
+    s_mq2_raw = read_mq2_raw();
+    s_mq2_median = s_mq2_filter.process(static_cast<float>(s_mq2_raw));
+    s_smoke_index = computeSmokeIndex(s_mq2_median);
+    s_smoke_severity = computeSmokeSeverity(s_smoke_index);
+    s_smoke_detected = computeSmokeDetected(s_smoke_index);
+
+    if (!dht_ok) {
+        Serial.println("[Sensor] DHT22 read failed; using last safe temperature/humidity values");
+    }
 
     // 2. Firewall evaluation — seconds granularity for timestamps
     uint32_t now_sec = now / 1000U;
@@ -318,7 +407,7 @@ static void sensor_task(uint32_t now)
     bool hum_fired = ocs::SoDFirewall::should_transmit(
         hum_filtered, now_sec, s_hum_firewall_config, s_hum_firewall_state);
 
-    if (!temp_fired && !hum_fired) {
+    if (!temp_fired && !hum_fired && !s_smoke_detected) {
         return;  // Nothing changed — suppress transmission
     }
 
@@ -333,17 +422,22 @@ static void sensor_task(uint32_t now)
     payload.temperature   = temp_filtered;
     payload.humidity      = hum_filtered;
     payload.node_id       = 0x01U;
-    payload.flags         = (static_cast<uint8_t>(temp_fired) << 0U) |
-                            (static_cast<uint8_t>(hum_fired)  << 1U);
+    payload.flags         = composeTelemetryFlags(temp_fired, hum_fired, s_smoke_detected);
     payload.sequence      = s_sequence++;
 
     // 4. Transmit raw bytes — no JSON, no String, no heap
+    // Binary telemetry is the production contract. Backend continues consuming it.
     bool pub_ok = s_mqtt_client.publish(
         OCS_LWT::DATA_TOPIC,
         reinterpret_cast<const uint8_t*>(&payload),
         sizeof(payload),
         OCS_LWT::QOS_DATA  // Use consistent QoS from config
     );
+
+    // JSON debug is only a mirror for MQTT Explorer/manual inspection.
+#if ENABLE_MQTT_JSON_DEBUG
+    publishTelemetryJsonDebug(payload);
+#endif
 
     if (!pub_ok) {
         Serial.printf("[Sensor] ✗ Publish FAILED (seq=%u, T=%.1f°C, H=%.1f%%)\n",
@@ -358,6 +452,7 @@ static void sensor_task(uint32_t now)
 // =============================================================================
 // ARDUINO ENTRY POINTS
 // =============================================================================
+#ifndef PIO_UNIT_TESTING
 void setup()
 {
     Serial.begin(115200);
@@ -373,8 +468,13 @@ void setup()
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);  // 0–3.3 V range
 
+    s_dht.begin();
     s_mqtt_client.setServer(MQTT_BROKER, MQTT_PORT);
+#if ENABLE_MQTT_JSON_DEBUG
+    s_mqtt_client.setBufferSize(384U); // Debug JSON mirror needs room for topic + JSON payload.
+#else
     s_mqtt_client.setBufferSize(64U);  // header + 16-byte payload fits easily
+#endif
 
     s_startup_ms = millis();
 
@@ -387,7 +487,9 @@ void setup()
         OCS_LWT::UPTIME_TOPIC,
         OCS_LWT::HEARTBEAT_TOPIC);
 }
+#endif
 
+#ifndef PIO_UNIT_TESTING
 void loop()
 {
     uint32_t now = millis();  // single read per loop — consistent timestamp
@@ -397,3 +499,4 @@ void loop()
     sensor_task(now);
     status_task(now);
 }
+#endif
